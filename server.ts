@@ -2,9 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 
 const app = express();
 app.use(express.json());
+
+const transports: Map<string, StreamableHTTPServerTransport> = new Map();
 
 function createServer() {
   const mcp = new McpServer({
@@ -74,11 +77,32 @@ app.get("/", (_req, res) => {
 
 app.post("/mcp", async (req, res) => {
   try {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+    if (sessionId && transports.has(sessionId)) {
+      const transport = transports.get(sessionId)!;
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
+
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined
+      sessionIdGenerator: () => randomUUID(),
     });
+
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid) transports.delete(sid);
+      console.log(`Session closed: ${sid}`);
+    };
+
     const mcp = createServer();
     await mcp.connect(transport);
+
+    if (transport.sessionId) {
+      transports.set(transport.sessionId, transport);
+      console.log(`Session created: ${transport.sessionId}`);
+    }
+
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
     console.error("MCP request error:", err);
@@ -88,12 +112,28 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-app.get("/mcp", (_req, res) => {
-  res.writeHead(405).end(JSON.stringify({ error: "Method not allowed. Use POST." }));
+app.get("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+  if (!sessionId || !transports.has(sessionId)) {
+    res.status(400).json({ error: "Missing or invalid session ID" });
+    return;
+  }
+
+  const transport = transports.get(sessionId)!;
+  await transport.handleRequest(req, res);
 });
 
-app.delete("/mcp", (_req, res) => {
-  res.writeHead(405).end(JSON.stringify({ error: "Method not allowed. Sessions not supported." }));
+app.delete("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+  if (!sessionId || !transports.has(sessionId)) {
+    res.status(400).json({ error: "Missing or invalid session ID" });
+    return;
+  }
+
+  const transport = transports.get(sessionId)!;
+  await transport.handleRequest(req, res);
 });
 
 const port = Number(process.env.PORT || 3000);
